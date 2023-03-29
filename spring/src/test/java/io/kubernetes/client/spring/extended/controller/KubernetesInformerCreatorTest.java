@@ -19,15 +19,20 @@ import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlMatching;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.verify;
+import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 
+import com.github.tomakehurst.wiremock.core.Admin;
+import com.github.tomakehurst.wiremock.extension.Parameters;
+import com.github.tomakehurst.wiremock.extension.PostServeAction;
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
-import com.google.gson.Gson;
+import com.github.tomakehurst.wiremock.stubbing.ServeEvent;
 import io.kubernetes.client.informer.SharedIndexInformer;
 import io.kubernetes.client.informer.SharedInformerFactory;
 import io.kubernetes.client.informer.cache.Lister;
 import io.kubernetes.client.openapi.ApiClient;
+import io.kubernetes.client.openapi.JSON;
 import io.kubernetes.client.openapi.models.V1ConfigMap;
 import io.kubernetes.client.openapi.models.V1ConfigMapList;
 import io.kubernetes.client.openapi.models.V1ListMeta;
@@ -37,7 +42,8 @@ import io.kubernetes.client.openapi.models.V1PodList;
 import io.kubernetes.client.util.ClientBuilder;
 import io.kubernetes.client.util.generic.GenericKubernetesApi;
 import java.util.Arrays;
-import org.junit.Rule;
+import java.util.concurrent.Semaphore;
+import org.junit.ClassRule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -50,14 +56,30 @@ import org.springframework.test.context.junit4.SpringRunner;
 @SpringBootTest
 public class KubernetesInformerCreatorTest {
 
-  @Rule public WireMockRule wireMockRule = new WireMockRule(8188);
+  public static class CountRequestAction extends PostServeAction {
+    @Override
+    public String getName() {
+      return "semaphore";
+    }
+
+    @Override
+    public void doAction(ServeEvent serveEvent, Admin admin, Parameters parameters) {
+      Semaphore count = (Semaphore) parameters.get("semaphore");
+      count.release();
+    }
+  }
+
+  @ClassRule
+  public static WireMockRule wireMockRule =
+      new WireMockRule(options().dynamicPort().extensions(new CountRequestAction()));
 
   @SpringBootApplication
   static class App {
 
     @Bean
     public ApiClient testingApiClient() {
-      ApiClient apiClient = new ClientBuilder().setBasePath("http://localhost:" + 8188).build();
+      ApiClient apiClient =
+          new ClientBuilder().setBasePath("http://localhost:" + wireMockRule.port()).build();
       return apiClient;
     }
 
@@ -91,6 +113,13 @@ public class KubernetesInformerCreatorTest {
     assertNotNull(podInformer);
     assertNotNull(configMapInformer);
 
+    Semaphore getCount = new Semaphore(2);
+    Semaphore watchCount = new Semaphore(2);
+    Parameters getParams = new Parameters();
+    Parameters watchParams = new Parameters();
+    getParams.put("semaphore", getCount);
+    watchParams.put("semaphore", watchCount);
+
     V1Pod foo1 =
         new V1Pod().kind("Pod").metadata(new V1ObjectMeta().namespace("default").name("foo1"));
     V1ConfigMap bar1 =
@@ -100,41 +129,51 @@ public class KubernetesInformerCreatorTest {
 
     wireMockRule.stubFor(
         get(urlMatching("^/api/v1/pods.*"))
+            .withPostServeAction("semaphore", getParams)
             .withQueryParam("watch", equalTo("false"))
             .willReturn(
                 aResponse()
                     .withStatus(200)
                     .withBody(
-                        new Gson()
-                            .toJson(
+                        new JSON()
+                            .serialize(
                                 new V1PodList()
                                     .metadata(new V1ListMeta().resourceVersion("0"))
                                     .items(Arrays.asList(foo1))))));
     wireMockRule.stubFor(
         get(urlMatching("^/api/v1/pods.*"))
+            .withPostServeAction("semaphore", watchParams)
             .withQueryParam("watch", equalTo("true"))
             .willReturn(aResponse().withStatus(200).withBody("{}")));
 
     wireMockRule.stubFor(
         get(urlMatching("^/api/v1/namespaces/default/configmaps.*"))
+            .withPostServeAction("semaphore", getParams)
             .withQueryParam("watch", equalTo("false"))
             .willReturn(
                 aResponse()
                     .withStatus(200)
                     .withBody(
-                        new Gson()
-                            .toJson(
+                        new JSON()
+                            .serialize(
                                 new V1ConfigMapList()
                                     .metadata(new V1ListMeta().resourceVersion("0"))
                                     .items(Arrays.asList(bar1))))));
     wireMockRule.stubFor(
         get(urlMatching("^/api/v1/namespaces/default/configmaps.*"))
+            .withPostServeAction("semaphore", watchParams)
             .withQueryParam("watch", equalTo("true"))
             .willReturn(aResponse().withStatus(200).withBody("{}")));
 
+    // These will be released for each web call above.
+    getCount.acquire(2);
+    watchCount.acquire(2);
+
     informerFactory.startAllRegisteredInformers();
 
-    Thread.sleep(200);
+    // Wait for the GETs to complete and the watches to start.
+    getCount.acquire(2);
+    watchCount.acquire(2);
 
     verify(
         1,
